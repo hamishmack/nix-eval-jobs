@@ -32,6 +32,8 @@
 #include <vector>
 #include <algorithm>
 
+#include <v3/eval_jobs_api.hh>
+
 #include "drv.hh"
 #include "eval-args.hh"
 
@@ -236,6 +238,74 @@ auto Drv::fromPackageInfo(std::string &attrPath, nix::EvalState &state,
     // Handle metadata (works in both modes)
     if (args.meta) {
         result.meta = queryMeta(packageInfo, state);
+    }
+
+    return result;
+}
+
+/* Model B: the value-side fields come from the v3-native accessors; the
+ * store-side block below is IDENTICAL to fromPackageInfo (it only needs the
+ * drvPath + store).  Keeping the two in lockstep is the whole point of
+ * Model B — v3 owns the heavy eval, the store pipeline is untouched. */
+auto Drv::fromV3(std::string &attrPath, nix::EvalState &state,
+                 nix::v3::EvalJobsHandle &v3h, MyArgs &args,
+                 Constituents constituents) -> Drv {
+    auto store = state.store;
+
+    // Value-side: v3 accessors instead of PackageInfo::query{Name,DrvPath,Outputs}.
+    // Force ORDER mirrors fromPackageInfo (name -> drvPath -> outputs), so a
+    // job that errors in one of these fields errors on the SAME field as the
+    // tree-walker (review 2026-07-20).
+    auto drvName = nix::v3::name(v3h);
+    auto drvPathStr = nix::v3::drvPath(v3h);
+    std::map<std::string, std::optional<nix::StorePath>> outputs;
+    for (const auto &[outputName, outPathStr] : nix::v3::outputs(v3h)) {
+        outputs[outputName] = store->parseStorePath(outPathStr);
+    }
+
+    Drv result{
+        .name = std::move(drvName),
+        .storeDir = store->storeDir,
+        .system = {},
+        .drvPath = store->parseStorePath(drvPathStr),
+        .outputs = std::move(outputs),
+        .neededBuilds = {},
+        .neededSubstitutes = {},
+        .unknownPaths = {},
+        .constituents = std::move(constituents),
+    };
+
+    // ---- store-side block: byte-for-byte identical to fromPackageInfo ----
+    auto localStore = store.dynamic_pointer_cast<nix::LocalFSStore>();
+    const bool canReadDerivation = localStore && !nix::settings.readOnlyMode;
+
+    if (canReadDerivation) {
+        auto drv = localStore->readDerivation(result.drvPath);
+
+        // Use the more precise system from the derivation
+        result.system = drv.platform;
+
+        if (args.checkCacheStatus) {
+            result.cacheStatus = queryCacheStatus(
+                *store, result.outputs, result.neededBuilds,
+                result.neededSubstitutes, result.unknownPaths, drv);
+        }
+
+        if (args.showInputDrvs) {
+            result.inputDrvs = queryInputDrvs(drv);
+        }
+
+        auto drvOptions = derivationOptionsFromStructuredAttrs(
+            *store, drv.env, get(drv.structuredAttrs));
+        result.requiredSystemFeatures =
+            std::optional(drvOptions.getRequiredSystemFeatures(drv));
+    } else {
+        // Read-only / remote store: querySystem replacement.
+        result.system = nix::v3::system(v3h);
+    }
+
+    if (args.meta) {
+        result.meta = nix::v3::meta(v3h);
     }
 
     return result;

@@ -34,6 +34,12 @@ stdenv.mkDerivation {
     nixComponents.nix-store
     nixComponents.nix-fetchers
     nixComponents.nix-expr
+    # Model B (NIX_EVAL_JOBS_PATCH_2026-07-18): the v3 bytecode-VM accessor
+    # surface. The v3 nix flake exposes this component via
+    # packaging/components.nix; the meson.build patch's
+    # dependency('nix-expr-v3') resolves against it. Required for the
+    # `nix build --override-input nix <v3-nix>` deploy route.
+    nixComponents.nix-expr-v3
     nixComponents.nix-flake
     nixComponents.nix-main
     nixComponents.nix-cmd

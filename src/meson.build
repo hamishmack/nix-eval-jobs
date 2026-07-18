@@ -21,6 +21,7 @@ common_deps = [
   nix_flake_dep,
   nix_main_dep,
   nix_cmd_dep,
+  nix_expr_v3_dep,
 ]
 
 nix_eval_jobs_lib = static_library(

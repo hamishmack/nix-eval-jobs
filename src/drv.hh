@@ -24,6 +24,10 @@ class EvalState;
 struct PackageInfo;
 } // namespace nix
 
+namespace nix::v3 {
+struct EvalJobsHandle; // Model B: v3-native accessor handle (eval_jobs_api.hh)
+} // namespace nix::v3
+
 struct Constituents {
     std::vector<std::string> constituents;
     std::vector<std::string> namedConstituents;
@@ -39,6 +43,19 @@ struct Drv {
     static Drv fromPackageInfo(std::string &attrPath, nix::EvalState &state,
                                nix::PackageInfo &packageInfo, MyArgs &args,
                                Constituents constituents = {});
+
+    /**
+     * Model B (NIX_EVAL_JOBS_PATCH_2026-07-18): build a Drv from the v3
+     * bytecode VM's current job value via the v3-native accessors
+     * (name/drvPath/outputs/system/meta), then run the SAME store-side block
+     * as fromPackageInfo (readDerivation / queryCacheStatus / queryInputDrvs /
+     * requiredSystemFeatures) byte-for-byte unchanged — those key off the
+     * drvPath + store, not the value.  Used when NIX_V3_DIRECT_EVAL routes a
+     * flake job through v3.
+     */
+    static Drv fromV3(std::string &attrPath, nix::EvalState &state,
+                      nix::v3::EvalJobsHandle &v3h, MyArgs &args,
+                      Constituents constituents = {});
 
     std::string name;
     std::string storeDir;
