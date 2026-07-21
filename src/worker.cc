@@ -392,6 +392,11 @@ auto processJobRequest(nix::EvalState &state, LineReader &fromReader,
                        nix::v3::EvalJobsHandlePtr &v3Handle,
                        const std::function<void()> &rebuildV3, MyArgs &args)
     -> bool {
+    // NIX_V3_REQUIRE (read once): when set, the v3 path must not silently
+    // fall back to the tree-walker — used by CI shadow runs to prove v3
+    // engaged.  In production it is unset, so the TW-retry net below is armed.
+    static const bool v3Require = std::getenv("NIX_V3_REQUIRE") != nullptr;
+
     /* Wait for the collector to send us a job name. */
     if (tryWriteLine(toParent.get(), "next") < 0) {
         return false; // main process died
@@ -421,14 +426,26 @@ auto processJobRequest(nix::EvalState &state, LineReader &fromReader,
             // fall through to the ORIGINAL tree-walker block below for
             // exact parity (review F2+F4), against a lazily-created TW root.
             //
-            // Error hardening (review, 2026-07-20): any exception escaping
-            // the v3 section (an eval error in a job is NORMAL in Hydra
-            // jobsets) unwinds mid-dispatch and may leave the handle's
-            // VMState frames/stacks in an indeterminate state.  Rather than
-            // reason about unwind-safety of the VM internals, we REBUILD the
-            // handle (cheap: root re-force is warm via the disk/applied
-            // caches) and rethrow so the outer catch still emits the same
-            // per-job Error response the tree-walker would.
+            // TW-RETRY SAFETY NET (review CR7-R1 / CR8-R1, 2026-07-22): v3 is
+            // the FAST PATH; the tree-walker is the correctness ORACLE.  On
+            // ANY exception from the v3 section — an eval error in a job is
+            // NORMAL in Hydra jobsets, but it can also be a v3-vs-TW semantic
+            // DIVERGENCE (a shape v3 rejects that TW accepts, or vice versa) —
+            // we rebuild the v3 handle (fresh VMState for subsequent jobs) and
+            // RETRY THIS JOB on the tree-walker instead of emitting v3's error
+            // directly.  Consequences:
+            //   * a genuine eval error: TW re-hits it and emits the error with
+            //     TW's exact position/trace formatting (byte-parity — fixes
+            //     the "v3 error bytes differ" divergence);
+            //   * a v3-vs-TW divergence where TW succeeds: hydra gets the
+            //     CORRECT TW result instead of a spurious per-job error / a
+            //     dropped build (fixes the whole divergence class: numeric
+            //     attr segments, CA outputs, non-attrset meta, output-shape
+            //     laxness, …).
+            // So a residual v3 divergence can never make hydra wrong or worse
+            // — worst case the divergent job is evaluated twice (slower).
+            // Under NIX_V3_REQUIRE we do NOT fall back (the mode exists to
+            // PROVE v3 engaged, for CI shadow runs), so we rethrow there.
             if (v3Handle) {
                 try {
                     nix::v3::descendAttrPath(
@@ -443,9 +460,14 @@ auto processJobRequest(nix::EvalState &state, LineReader &fromReader,
                         return Response::Attrs{{}};
                     }
                     // else: parity fallback → tree-walker path below.
-                } catch (...) {
+                } catch (const std::exception & e) {
                     rebuildV3(); // fresh VMState for the NEXT job
-                    throw;       // outer catch → per-job Error response
+                    if (v3Require)
+                        throw;   // no silent fallback under NIX_V3_REQUIRE
+                    std::cerr << "nix-eval-jobs: v3 job '" << attrPathS
+                              << "' errored, retrying on the tree-walker: "
+                              << e.what() << '\n';
+                    // fall through to the tree-walker path below (retry).
                 }
             }
 
@@ -567,7 +589,16 @@ void worker(
     // fromArgs is false and/or autoArgs is non-empty.
     const bool v3ExprShape = args.fromArgs && autoArgs.size() == 0;
 
-    if (v3Direct && ((args.flake && lockFlagsV3Compatible) || v3ExprShape)) {
+    // Review CR6-D4 (2026-07-22): --apply transforms each job value via a
+    // tree-walker callFunction and emits the result as `extraValue`
+    // (response.cc).  The v3 processDerivationV3 path carries no extraValue,
+    // so engaging v3 under --apply would silently DROP it.  Hydra does not
+    // pass --apply, but the engagement gate must enforce that rather than
+    // rely on it — require an empty applyExpr for v3 to engage.
+    const bool v3ApplyOk = args.applyExpr.empty();
+
+    if (v3Direct && v3ApplyOk
+        && ((args.flake && lockFlagsV3Compatible) || v3ExprShape)) {
         // Wire libcmd's flakeSettings global into v3's thread-local pointer so
         // the native builtins.getFlake can lock/read the flake (mirrors the
         // `nix` CLI's main.cc startup wiring; the worker runs in its own
