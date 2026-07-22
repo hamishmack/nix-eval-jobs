@@ -17,6 +17,8 @@
 // misc-include-cleaner wants this header rather than the C++ version
 #include <stdlib.h>
 // NOLINTEND(modernize-deprecated-headers)
+#include <cstdlib>   // std::getenv — do not rely on <stdlib.h> to hoist it (RR9-3, 2026-07-22)
+#include <cctype>    // std::tolower (env-flag value parse)
 #include <exception>
 #include <filesystem>
 #include <functional>
@@ -62,6 +64,47 @@ struct Expr;
 } // namespace nix
 
 namespace {
+
+// A NIX_V3_* gate is ENABLED iff the variable is set to a non-disabling value.
+// The prior presence-only check (`getenv(...) != nullptr`) made `=0` ENGAGE v3
+// — a genuine ops footgun and a broken kill-switch (RR1-F6/RR3, 2026-07-22):
+// an operator disabling the gate via `NIX_V3_DIRECT_EVAL=0` in the
+// hydra-evaluator unit would silently KEEP v3 on.  Treat unset, "", "0",
+// "false", "no", "off" (case-insensitive) as disabled; anything else as on.
+auto envFlagEnabled(const char *name) -> bool {
+    const char *v = std::getenv(name);
+    if ((v == nullptr) || (*v == 0)) {
+        return false;
+    }
+    std::string s(v);
+    for (auto &c : s) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return !(s == "0" || s == "false" || s == "no" || s == "off");
+}
+
+// True when the v3 dispatch loop's internal exception barrier
+// (clearBlackMarksOnException) has already restored the handle's VMState after
+// the exception `e`: it runs on ANY exception escaping a force/call and unwinds
+// vm.frames/valueStack/withStack back to the synthetic outer frame while
+// reverting in-flight thunks Blackhole→Suspended.  All nix evaluation errors
+// (nix::BaseError — ThrownError, AssertionError, TypeError, the accessor's own
+// nix::Error, …) and the v3-typed VM errors flow through it, and the accessor's
+// own throws happen at that same baseline (no frames pushed).  For those the
+// handle is IMMEDIATELY reusable (descendAttrPath re-forces the rooted root at
+// its start), so a full getFlake root-replay rebuild — with a second live heap
+// under GC_DONT_GC=1 — is pure overhead on the routine per-job error (RR7-C1 /
+// RR8-R1 / RR6 / RR1-F4, 2026-07-22).  Only a genuinely-unexpected exception
+// type (which may have bypassed the barrier / signal VM-state corruption)
+// warrants the safety-net rebuild.
+auto v3StateCleanAfter(const std::exception &e) -> bool {
+    return (dynamic_cast<const nix::BaseError *>(&e) != nullptr)
+        || (dynamic_cast<const nix::v3::CallDepthError *>(&e) != nullptr)
+        || (dynamic_cast<const nix::v3::BlackholeError *>(&e) != nullptr)
+        || (dynamic_cast<const nix::v3::AssertionError *>(&e) != nullptr)  // + ThrownError
+        || (dynamic_cast<const nix::v3::AbortError *>(&e) != nullptr);
+}
+
 auto releaseExprTopLevelValue(nix::EvalState &state, nix::Bindings &autoArgs,
                               MyArgs &args) -> nix::Value * {
     nix::Value vTop;
@@ -461,7 +504,16 @@ auto processJobRequest(nix::EvalState &state, LineReader &fromReader,
                     }
                     // else: parity fallback → tree-walker path below.
                 } catch (const std::exception & e) {
-                    rebuildV3(); // fresh VMState for the NEXT job
+                    // Only rebuild the whole handle for a genuinely-unexpected
+                    // exception.  A routine per-job eval error (the common
+                    // Hydra case: `throw`, assertions, unsupported systems)
+                    // left the VMState clean via the v3 dispatch loop's
+                    // exception barrier, so the handle is reused as-is — no
+                    // getFlake root-replay + no second live heap per error
+                    // (RR7-C1/RR8-R1/RR6/RR1-F4, 2026-07-22).  See
+                    // v3StateCleanAfter.
+                    if (!v3StateCleanAfter(e))
+                        rebuildV3(); // fresh VMState for the NEXT job
                     if (v3Require)
                         throw;   // no silent fallback under NIX_V3_REQUIRE
                     std::cerr << "nix-eval-jobs: v3 job '" << attrPathS
@@ -553,8 +605,11 @@ void worker(
     //     unset falls back to the tree-walker (byte-for-byte the original path).
     //   NIX_V3_REQUIRE     — hard-fail if v3 does not engage (no silent TW
     //     fallback), so CI can prove the v3 path is exercised.
-    const bool v3Direct = std::getenv("NIX_V3_DIRECT_EVAL") != nullptr;
-    const bool v3Require = std::getenv("NIX_V3_REQUIRE") != nullptr;
+    // Value-parsed (RR1-F6/RR3): `NIX_V3_DIRECT_EVAL=0` DISABLES v3 (was: any
+    // presence engaged it).  NIX_V3_DIRECT_EVAL=0 is therefore the in-unit
+    // kill-switch (a redeploy that flips the value, no env-var removal needed).
+    const bool v3Direct = envFlagEnabled("NIX_V3_DIRECT_EVAL");
+    const bool v3Require = envFlagEnabled("NIX_V3_REQUIRE");
 
     nix::v3::EvalJobsHandlePtr v3Handle; // null unless v3 engages
     nix::Value *vRoot = nullptr;
@@ -650,13 +705,14 @@ void worker(
         return vRoot;
     };
 
-    // Rebuild the v3 handle after a per-job v3 exception (see
-    // processJobRequest).  Order is load-bearing: reset() FIRST — the
-    // handle's two GcRoot registrations are popped LIFO while they are the
-    // stack's top entries (GcRoot::~GcRoot pops blindly); constructing the
-    // replacement first would interleave push/pop and corrupt the root
-    // stack.  If the rebuild itself fails, remaining jobs on this worker
-    // use the tree-walker root (exactly the engagement-failure fallback).
+    // Rebuild the v3 handle (safety net for a genuinely-unexpected exception;
+    // routine per-job errors skip this — see processJobRequest /
+    // v3StateCleanAfter).  reset() runs FIRST as a convention, but it is no
+    // longer load-bearing for correctness: GcRoot::~GcRoot erases its OWN
+    // registry entry (find-and-erase, not a blind LIFO pop — CR5-#3), so
+    // constructing the replacement before destroying the old handle is safe.
+    // If the rebuild itself fails, remaining jobs on this worker use the
+    // tree-walker root (exactly the engagement-failure fallback).
     auto rebuildV3 = [&]() noexcept {
         try {
             v3Handle.reset();
