@@ -238,6 +238,16 @@ struct State {
     std::exception_ptr exc;
 };
 
+/* Worker death distinct from ordinary evaluation errors, so the collector
+   can respawn the worker and retry the in-flight attrPath on a
+   tree-walker-only worker instead of failing the WHOLE eval (hydra
+   RR1-F2: a SIGSEGV in the v3 VM bypasses the per-job in-worker
+   tree-walker retry net, which catches C++ exceptions only). */
+class WorkerDied : public nix::Error {
+  public:
+    using nix::Error::Error;
+};
+
 void handleBrokenWorkerPipe(Proc &proc, std::string_view msg) {
     // we already took the process status from Proc, no
     // need to wait for it again to avoid error messages
@@ -248,7 +258,7 @@ void handleBrokenWorkerPipe(Proc &proc, std::string_view msg) {
         const int result = waitpid(pid, &status, WNOHANG);
         if (result == 0) {
             kill(pid, SIGKILL);
-            throw nix::Error(
+            throw WorkerDied(
                 "BUG: while %s, worker pipe got closed but evaluation "
                 "worker still running?",
                 msg);
@@ -256,25 +266,25 @@ void handleBrokenWorkerPipe(Proc &proc, std::string_view msg) {
 
         if (result == -1) {
             kill(pid, SIGKILL);
-            throw nix::Error(
+            throw WorkerDied(
                 "BUG: while %s, waitpid for evaluation worker failed: %s", msg,
                 get_error_name(errno));
         }
         if (WIFEXITED(status)) {
             if (WEXITSTATUS(status) == 1) {
-                throw nix::Error(
+                throw WorkerDied(
                     "while %s, evaluation worker exited with exit code 1, "
                     "(possible infinite recursion)",
                     msg);
             }
-            throw nix::Error("while %s, evaluation worker exited with %d", msg,
+            throw WorkerDied("while %s, evaluation worker exited with %d", msg,
                              WEXITSTATUS(status));
         }
 
         if (WIFSIGNALED(status)) {
             switch (WTERMSIG(status)) {
             case SIGKILL:
-                throw nix::Error(
+                throw WorkerDied(
                     "while %s, evaluation worker got killed by SIGKILL, "
                     "maybe "
                     "memory limit reached?",
@@ -282,20 +292,20 @@ void handleBrokenWorkerPipe(Proc &proc, std::string_view msg) {
                 break;
 #ifdef __APPLE__
             case SIGBUS:
-                throw nix::Error(
+                throw WorkerDied(
                     "while %s, evaluation worker got killed by SIGBUS, "
                     "(possible infinite recursion)",
                     msg);
                 break;
 #else
             case SIGSEGV:
-                throw nix::Error(
+                throw WorkerDied(
                     "while %s, evaluation worker got killed by SIGSEGV, "
                     "(possible infinite recursion)",
                     msg);
 #endif
             default:
-                throw nix::Error("while %s, evaluation worker got killed by "
+                throw WorkerDied("while %s, evaluation worker got killed by "
                                  "signal %d (%s)",
                                  msg, WTERMSIG(status),
                                  get_signal_name(WTERMSIG(status)));
@@ -424,10 +434,26 @@ void updateJobQueue(nix::Sync<State> &state_, std::condition_variable &wakeup,
 }
 } // namespace
 
+/* A worker that never engages the v3 pipeline: used to retry the single
+   attrPath whose v3 worker crashed (SIGSEGV in the VM).  The env override
+   happens in the forked CHILD, so concurrent collector threads spawning
+   normal v3 workers are unaffected.  NIX_V3_DIRECT_EVAL is value-parsed
+   ("0" disables) as of the round-3 review. */
+const Processor treeWalkerOnlyWorker = [](MyArgs &args, nix::AutoCloseFD &toFd,
+                                          nix::AutoCloseFD &fromFd) -> void {
+    setenv("NIX_V3_DIRECT_EVAL", "0", 1); // NOLINT(concurrency-mt-unsafe)
+    unsetenv("NIX_V3_REQUIRE");           // NOLINT(concurrency-mt-unsafe)
+    worker(args, toFd, fromFd);
+};
+
 void collector(nix::Sync<State> &state_, std::condition_variable &wakeup) {
     try {
         std::optional<std::unique_ptr<Proc>> proc_;
         std::optional<std::unique_ptr<LineReader>> fromReader_;
+        // Consecutive worker deaths OUTSIDE a job round-trip (startup /
+        // between jobs).  Bounded so a worker that can't even come up
+        // doesn't respawn forever.
+        int idleDeaths = 0;
 
         while (true) {
             // Initialize worker if needed
@@ -439,8 +465,27 @@ void collector(nix::Sync<State> &state_, std::condition_variable &wakeup) {
                     std::make_unique<LineReader>(proc_.value()->from.release());
             }
 
-            auto line = checkWorkerStatus(fromReader_.value().get(),
-                                          proc_.value().get());
+            std::string_view line;
+            try {
+                line = checkWorkerStatus(fromReader_.value().get(),
+                                         proc_.value().get());
+                idleDeaths = 0;
+            } catch (const WorkerDied &err) {
+                // Worker died at startup or between jobs (no attrPath in
+                // flight, nothing lost) — respawn instead of failing the
+                // whole eval.
+                if (++idleDeaths > 5) {
+                    throw;
+                }
+                nix::logger->log(
+                    nix::lvlError,
+                    nix::fmt("nix-eval-jobs: worker died outside a job (%s); "
+                             "respawning (%d/5)",
+                             err.msg(), idleDeaths));
+                proc_ = std::nullopt;
+                fromReader_ = std::nullopt;
+                continue;
+            }
             if (line == "restart") {
                 // Reset worker
                 proc_ = std::nullopt;
@@ -455,15 +500,56 @@ void collector(nix::Sync<State> &state_, std::condition_variable &wakeup) {
             }
             const auto &attrPath = maybeAttrPath.value();
 
-            if (tryWriteLine(proc_.value()->to.get(), "do " + attrPath.dump()) <
-                0) {
-                auto msg = "sending attrPath '" + joinAttrPath(attrPath) + "'";
-                handleBrokenWorkerPipe(*proc_.value(), msg);
-            }
+            std::vector<nlohmann::json> newAttrs;
+            try {
+                if (tryWriteLine(proc_.value()->to.get(),
+                                 "do " + attrPath.dump()) < 0) {
+                    auto msg =
+                        "sending attrPath '" + joinAttrPath(attrPath) + "'";
+                    handleBrokenWorkerPipe(*proc_.value(), msg);
+                }
 
-            auto newAttrs =
-                processWorkerResponse(fromReader_.value().get(), attrPath,
-                                      proc_.value().get(), state_);
+                newAttrs =
+                    processWorkerResponse(fromReader_.value().get(), attrPath,
+                                          proc_.value().get(), state_);
+            } catch (const WorkerDied &err) {
+                // The v3 worker died mid-job (e.g. SIGSEGV in the v3 VM —
+                // hydra RR1-F2).  The in-worker per-job tree-walker retry
+                // net catches C++ exceptions only, so mirror it here at the
+                // collector level: spawn a tree-walker-only worker, retry
+                // JUST this attrPath on it, then resume with a fresh v3
+                // worker.  If the tree-walker retry also dies, the failure
+                // is real and propagates.
+                nix::logger->log(
+                    nix::lvlError,
+                    nix::fmt("nix-eval-jobs: v3 worker died (%s); retrying "
+                             "attrPath '%s' on a tree-walker-only worker",
+                             err.msg(), joinAttrPath(attrPath)));
+                proc_ = std::nullopt;
+                fromReader_ = std::nullopt;
+
+                auto twProc = std::make_unique<Proc>(treeWalkerOnlyWorker);
+                auto twReader =
+                    std::make_unique<LineReader>(twProc->from.release());
+                auto twLine = checkWorkerStatus(twReader.get(), twProc.get());
+                if (twLine == "restart") {
+                    throw nix::Error(
+                        "tree-walker-only retry worker for attrPath '%s' "
+                        "requested restart at startup",
+                        joinAttrPath(attrPath));
+                }
+                if (tryWriteLine(twProc->to.get(), "do " + attrPath.dump()) <
+                    0) {
+                    auto msg = "sending attrPath '" + joinAttrPath(attrPath) +
+                               "' (tree-walker retry)";
+                    handleBrokenWorkerPipe(*twProc, msg);
+                }
+                newAttrs = processWorkerResponse(twReader.get(), attrPath,
+                                                 twProc.get(), state_);
+                // Shut the one-shot tree-walker worker down; ignore write
+                // failures (it may have exited already).
+                (void)tryWriteLine(twProc->to.get(), "exit");
+            }
 
             updateJobQueue(state_, wakeup, attrPath, newAttrs);
         }
