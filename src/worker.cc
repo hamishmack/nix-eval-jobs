@@ -59,6 +59,46 @@
 #include "eval-args.hh"
 #include "store.hh"
 
+#include <chrono>
+#include <unistd.h>
+
+namespace {
+/* eval-trace: cheap, grep-able per-job / per-worker timing for measuring
+   where evaluation wall time goes (IFD blocking vs. evaluation vs. worker
+   respawn).  One whole line per write(2) so lines from concurrent workers
+   never interleave in the hydra-evaluator journal.  Enabled when
+   NIX_EVAL_JOBS_TRACE is set to a non-"0" value.  Grep: `nej-trace `. */
+auto traceEnabled() -> bool {
+    static const bool on = [] {
+        const char *v = std::getenv("NIX_EVAL_JOBS_TRACE");
+        return v != nullptr && std::string_view(v) != "0" && *v != '\0';
+    }();
+    return on;
+}
+auto nowMs() -> long long {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+auto currentRssMb() -> long {
+    struct rusage ru = {};
+    getrusage(RUSAGE_SELF, &ru);
+#ifdef __APPLE__
+    return static_cast<long>(ru.ru_maxrss / (1024 * 1024));
+#else
+    return static_cast<long>(ru.ru_maxrss / 1024);
+#endif
+}
+struct WorkerTrace {
+    long long spawnMs = nowMs();
+    unsigned long jobs = 0;
+    long long ifdMs = 0;   // summed IFD realise time (profiling on)
+    long long evalMs = 0;  // summed per-job wall time
+};
+WorkerTrace workerTrace; // per-process: each worker is a fresh fork
+void traceLine(const std::string &s) { nix::writeToStderr("nej-trace " + s + "\n"); }
+} // namespace
+
 namespace nix {
 struct Expr;
 } // namespace nix
@@ -459,6 +499,10 @@ auto processJobRequest(nix::EvalState &state, LineReader &fromReader,
     auto path = nlohmann::json::parse(line.substr(3));
     auto attrPathS = attrPathJoin(path);
 
+    const auto jobT0 = nowMs();
+    const auto ifdN0 = state.getNrIFDs();
+    const auto ifdUs0 = state.getTotalIFDTime().count();
+
     /* Evaluate it and send info back to the collector. */
     Response::Payload payload = [&]() -> Response::Payload {
         try {
@@ -574,6 +618,23 @@ auto processJobRequest(nix::EvalState &state, LineReader &fromReader,
         }
     }();
 
+    if (traceEnabled()) {
+        const auto ms = nowMs() - jobT0;
+        const auto ifdMs = (state.getTotalIFDTime().count() - ifdUs0) / 1000;
+        const char *kind = std::holds_alternative<Response::Job>(payload)
+                               ? "job"
+                           : std::holds_alternative<Response::Attrs>(payload)
+                               ? "attrs"
+                               : "error";
+        workerTrace.jobs++;
+        workerTrace.evalMs += ms;
+        workerTrace.ifdMs += ifdMs;
+        traceLine(nix::fmt("job pid=%d ms=%d ifds=%d ifd_ms=%d rss_mb=%d "
+                           "kind=%s attr=%s",
+                           getpid(), ms, state.getNrIFDs() - ifdN0, ifdMs,
+                           currentRssMb(), kind, attrPathS));
+    }
+
     Response const response{
         .attr = attrPathS,
         .attrPath = path.get<std::vector<std::string>>(),
@@ -594,6 +655,9 @@ void worker(
     MyArgs &args,
     nix::AutoCloseFD &toParent, // NOLINT(bugprone-easily-swappable-parameters)
     nix::AutoCloseFD &fromParent) {
+
+    // Forked from the master: reset the inherited trace clock/counters.
+    workerTrace = WorkerTrace{};
 
     auto evalStore = nix_eval_jobs::openStore(args.evalStoreUrl);
     auto state = nix::make_ref<nix::EvalState>(
@@ -728,6 +792,11 @@ void worker(
         }
     };
 
+    if (traceEnabled()) {
+        traceLine(nix::fmt("worker-ready pid=%d init_ms=%d rss_mb=%d", getpid(),
+                           nowMs() - workerTrace.spawnMs, currentRssMb()));
+    }
+
     LineReader fromReader(fromParent.release());
 
     while (processJobRequest(*state, fromReader, toParent, autoArgs,
@@ -735,6 +804,14 @@ void worker(
         // Continue processing jobs until we need to exit
     }
 
+    if (traceEnabled()) {
+        traceLine(nix::fmt(
+            "worker-exit pid=%d reason=%s life_ms=%d jobs=%d eval_ms=%d "
+            "ifd_ms=%d rss_mb=%d",
+            getpid(), shouldRestart(args) ? "max-memory" : "exit",
+            nowMs() - workerTrace.spawnMs, workerTrace.jobs,
+            workerTrace.evalMs, workerTrace.ifdMs, currentRssMb()));
+    }
     if (tryWriteLine(toParent.get(), "restart") < 0) {
         return; // main process died
     };
